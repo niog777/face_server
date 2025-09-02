@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+requests
+opencv-contrib-python
+mediapipe
+numpy
+pillow

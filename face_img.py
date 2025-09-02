@@ -1,41 +1,60 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-face_image_analysis_12palaces_labeled.py
-------------------------------------
-依赖:
-  pip install opencv-python mediapipe numpy pillow
-
-功能:
-  - 静态图片人脸关键点(468点)分析：MediaPipe Face Mesh
-  - 三庭/五眼计算（不在图上写字）
-  - 十二宫：动态几何选区（矩形框），并在框旁标注“是什么宫”
-  - 标签：默认用拼音(ASCII)；传 --font 使用中文字体文件(.ttf/.otf)即可中文显示
-  - 批处理/递归 & 可选 JSON 汇总
-
-用法:
-  # 单图
-  python face_image_analysis_12palaces_labeled.py --input input.jpg --out out
-
-  # 目录（递归）+ JSON 汇总
-  python face_image_analysis_12palaces_labeled.py --input imgs/ --out out --recursive --save-json out/summary.json
-
-  # 指定中文字体
-  python face_image_analysis_12palaces_labeled.py --input input.jpg --out out --font "C:/Windows/Fonts/simhei.ttf"
-"""
-
+# ──────────────────────────────────────────────────────────────────────────────
+# face_img.py — 图像几何分析与可视化，仅暴露清晰 API
+# ──────────────────────────────────────────────────────────────────────────────
 import os
 import cv2
-import json
 import glob
+import json
 import math
-import argparse
 import numpy as np
 from typing import List, Tuple, Dict, Any
 
 import mediapipe as mp
-from PIL import Image, ImageDraw, ImageFont  # 用于中文标签
+from PIL import Image, ImageDraw, ImageFont
 
+# MediaPipe 句柄
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+mp_face_mesh = mp.solutions.face_mesh
+
+# 公开：供上层调用的配置（必要时也可从上层传入覆盖）
+CONFIG = dict(
+    forehead_upper_band=0.25,
+    forehead_mid_band=0.50,
+    under_eye_h=0.30,
+    cheek_wedge_w=1.30,
+    cheek_wedge_h=0.90,
+    nose_width_margin=1.20,
+    nose_height_margin=1.10,
+    philtrum_width_ratio=0.25,
+    jaw_band_h=0.45,
+    eyebrow_upper_band_ratio=0.45,
+    color_palace=(60, 220, 60),  # BGR
+)
+
+# ASCII 安全标签（无中文字体时使用）
+PALACE_PINYIN = {
+    "父母宫_左": "fumu-zuo",
+    "父母宫_右": "fumu-you",
+    "官禄宫": "guanlu",
+    "福德宫": "fude",
+    "田宅宫_左": "tianzhai-zuo",
+    "田宅宫_右": "tianzhai-you",
+    "命宫": "minggong",
+    "兄弟宫_左": "xiongdi-zuo",
+    "兄弟宫_右": "xiongdi-you",
+    "子女宫": "zinv",
+    "夫妻宫_左": "fuqi-zuo",
+    "夫妻宫_右": "fuqi-you",
+    "财帛宫": "caibo",
+    "疾厄宫": "jiee",
+    "迁移宫_左": "qianyi-zuo",
+    "迁移宫_右": "qianyi-you",
+    "仆役宫_左": "puyi-zuo",
+    "仆役宫_右": "puyi-you",
+}
+
+# -------------------------- 工具函数 --------------------------
 def _json_default(o):
     import numpy as _np
     if isinstance(o, (_np.floating,)):
@@ -46,63 +65,6 @@ def _json_default(o):
         return o.tolist()
     return str(o)
 
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-mp_face_mesh = mp.solutions.face_mesh
-
-# ---------------------------------- 可调配置 ----------------------------------
-CONFIG = dict(
-    # 额头带（相对“额头代表点10”与“眉骨均值行”的比例划分）
-    forehead_upper_band=0.25,
-    forehead_mid_band=0.50,
-
-    # 眼下“子女宫”高度（相对两眼高度平均值）
-    under_eye_h=0.30,
-
-    # 夫妻宫：外眼角→颧部的楔形区域宽高比例（相对眼宽/眼高）
-    cheek_wedge_w=1.30,
-    cheek_wedge_h=0.90,
-
-    # 鼻翼/鼻头框扩展（财帛宫）
-    nose_width_margin=1.20,
-    nose_height_margin=1.10,
-
-    # 人中（疾厄宫）宽度（相对嘴宽）
-    philtrum_width_ratio=0.25,
-
-    # 下颌带（仆役宫）高度（相对 鼻底→下巴 的距离）
-    jaw_band_h=0.45,
-
-    # 眉上带（福德/田宅）厚度（相对 眉到额头中线 距离）
-    eyebrow_upper_band_ratio=0.45,
-
-    # 可视化颜色 (B,G,R)
-    color_palace=(60, 220, 60),
-)
-
-# 拼音标签（ASCII 安全）。如果使用 --font 指向中文字体，将直接用中文名称。
-PALACE_PINYIN = {
-    "父母宫_左": "父母宫_左",
-    "父母宫_右": "父母宫_右",
-    "官禄宫": "官禄宫",
-    "福德宫": "福德宫",
-    "田宅宫_左": "田宅宫_左",
-    "田宅宫_右": "田宅宫_右",
-    "命宫": "命宫",
-    "兄弟宫_左": "兄弟宫_左",
-    "兄弟宫_右": "兄弟宫_右",
-    "子女宫": "子女宫",
-    "夫妻宫_左": "夫妻宫_左",
-    "夫妻宫_右": "夫妻宫_右",
-    "财帛宫": "财帛宫",
-    "疾厄宫": "疾厄宫",
-    "迁移宫_左": "迁移宫_左",
-    "迁移宫_右": "迁移宫_右",
-    "仆役宫_左": "仆役宫_左",
-    "仆役宫_右": "仆役宫_右",
-}
-
-# ---------------------------------- 工具函数 ----------------------------------
 def _to_xyzc(lm, w: int, h: int) -> np.ndarray:
     return np.array([lm.x * w, lm.y * h, lm.z], dtype=np.float32)
 
@@ -110,14 +72,6 @@ def _dist2d(p1, p2) -> float:
     p1 = np.asarray(p1, dtype=np.float32)
     p2 = np.asarray(p2, dtype=np.float32)
     return float(np.linalg.norm(p1[:2] - p2[:2]))
-
-def _poly_area_xy(points_xy: List[Tuple[float, float]]) -> float:
-    if len(points_xy) < 3:
-        return 0.0
-    x = np.array([p[0] for p in points_xy], dtype=np.float32)
-    y = np.array([p[1] for p in points_xy], dtype=np.float32)
-    s = float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-    return abs(s) * 0.5
 
 def _convex_area(points_xy: List[Tuple[float, float]]) -> float:
     if len(points_xy) < 3:
@@ -155,10 +109,7 @@ def _region_metrics(points: List[np.ndarray], idxs: List[int]) -> Dict[str, Any]
         indices=idxs[:]
     )
 
-def _midpoint(p, q):
-    return ( (p[0]+q[0]) * 0.5, (p[1]+q[1]) * 0.5 )
-
-# ---------------------------------- 三庭/五眼 ----------------------------------
+# ----------------------- 三庭 / 五眼 -----------------------
 def analyze_three_court(points: List[np.ndarray]) -> Dict[str, Any]:
     FOREHEAD_LINE = 10
     BROW_LINE     = 9
@@ -197,7 +148,7 @@ def analyze_five_eye(points: List[np.ndarray]) -> Dict[str, Any]:
         anchors=dict(L_border=234, L_outer=130, L_inner=133, R_inner=362, R_outer=359, R_border=454)
     )
 
-# ---------------------------------- 宫位：动态选区（矩形） ----------------------------------
+# ---------------------- 宫位框生成 ----------------------
 BROW_LEFT  = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
 BROW_RIGHT = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
 EYE_ANCHORS = dict(L_outer=130, L_inner=133, R_inner=362, R_outer=359)
@@ -208,9 +159,6 @@ UPPER_LIP=13
 
 def _y_mean(points: List[np.ndarray], idxs: List[int]) -> float:
     return float(np.mean([points[i][1] for i in idxs]))
-
-def _x_mean(points: List[np.ndarray], idxs: List[int]) -> float:
-    return float(np.mean([points[i][0] for i in idxs]))
 
 def _palace_boxes(points: List[np.ndarray], w: int, h: int) -> Dict[str, Tuple[float,float,float,float]]:
     cfg = CONFIG
@@ -307,6 +255,7 @@ def _palace_boxes(points: List[np.ndarray], w: int, h: int) -> Dict[str, Tuple[f
     # 仆役宫（下颌两侧）
     jaw_y1 = chin[1] - CONFIG["jaw_band_h"] * nose2chin
     jaw_y2 = chin[1]
+    mid_x = 0.5*(xL+xR)
     jaw_left  = (xL, jaw_y1, (xL+mid_x)*0.5, jaw_y2)
     jaw_right = ((mid_x+xR)*0.5, jaw_y1, xR, jaw_y2)
 
@@ -319,6 +268,7 @@ def _palace_boxes(points: List[np.ndarray], w: int, h: int) -> Dict[str, Tuple[f
         仆役宫_左=jaw_left, 仆役宫_右=jaw_right,
     )
 
+
 def analyze_palaces(points: List[np.ndarray], w: int, h: int) -> Dict[str, Any]:
     boxes = _palace_boxes(points, w, h)
     feats = {}
@@ -328,9 +278,8 @@ def analyze_palaces(points: List[np.ndarray], w: int, h: int) -> Dict[str, Any]:
         feats[name]["box"] = [float(x1), float(y1), float(x2), float(y2)]
     return feats
 
-# ---------------------------------- 绘制 ----------------------------------
+# ----------------------- 绘制 -----------------------
 def draw_overlay(img, flandmarks):
-    # 仅画网格，不写文字，避免乱码
     mp_drawing.draw_landmarks(
         image=img,
         landmark_list=flandmarks,
@@ -346,47 +295,46 @@ def draw_overlay(img, flandmarks):
         connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
     )
 
-def draw_label(img_bgr, text, x, y, color=(60,220,60), font_path=None, font_size=24):
+
+def _draw_text(img_bgr, text, x, y, color=(60,220,60), font_path=None, font_size=24):
+    # 优先 FreeType（需要 opencv-contrib-python）
     if font_path:
-        # OpenCV FreeType 画中文
         try:
-            ft = cv2.freetype.createFreeType2()
-            ft.loadFontData(font_path, 0)  # 第二个参数是 TTC 的 face index
-            ft.putText(img_bgr, text, (int(x), int(y)),
-                       fontHeight=font_size, color=color, thickness=-1, line_type=cv2.LINE_AA, bottomLeftOrigin=False)
-            return
-        except Exception as e:
-            # 回退到 Pillow（如果你也装了 Pillow）
-            try:
-                from PIL import Image, ImageDraw, ImageFont
-                img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-                draw = ImageDraw.Draw(img_pil)
-                font = ImageFont.truetype(font_path, font_size)
-                draw.text((int(x), int(y)), text, fill=(color[2], color[1], color[0]), font=font)
-                img_bgr[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            if hasattr(cv2, "freetype"):
+                ft = cv2.freetype.createFreeType2()
+                ft.loadFontData(font_path, 0)
+                ft.putText(img_bgr, text, (int(x), int(y)),
+                           fontHeight=font_size, color=color, thickness=1, line_type=cv2.LINE_AA, bottomLeftOrigin=False)
                 return
-            except:
-                pass
-    # 最终兜底（ASCII）：仍然会把中文变成 ???，所以仅当没有字体可用时才走到这里
-    cv2.putText(img_bgr, text, (int(x), int(y)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        except Exception:
+            pass
+        # Pillow 回退
+        try:
+            img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(img_pil)
+            font = ImageFont.truetype(str(font_path), font_size)
+            draw.text((int(x), int(y)), text, fill=(color[2], color[1], color[0]), font=font)
+            img_bgr[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            return
+        except Exception:
+            pass
+    # ASCII 兜底
+    cv2.putText(img_bgr, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
 
 def draw_palace_boxes_with_labels(img, pal_feats: Dict[str, Any], font_path=None):
     color = CONFIG["color_palace"]
     for name, feat in pal_feats.items():
-        if "box" not in feat: 
+        if "box" not in feat:
             continue
         x1,y1,x2,y2 = map(int, feat["box"])
-        # 边框
         cv2.rectangle(img, (x1,y1), (x2,y2), color, 1)
-        # 标签（左上角上方 4px）
         label = name if font_path else PALACE_PINYIN.get(name, name)
-        draw_label(img, label, x1, max(12, y1 - 4), color=color, font_path=font_path, font_size=12)
+        _draw_text(img, label, x1, max(12, y1 - 4), color=color, font_path=font_path, font_size=12)
 
-# ---------------------------------- IO ----------------------------------
-def resize_keep_max(img, max_w: int, max_h: int):
-    if (max_w is None and max_h is None) or (max_w == 0 and max_h == 0):
+
+def resize_keep_max(img, max_w: int | None, max_h: int | None):
+    if (not max_w and not max_h) or (max_w == 0 and max_h == 0):
         return img
     h, w = img.shape[:2]
     if max_w is None: max_w = w
@@ -397,98 +345,57 @@ def resize_keep_max(img, max_w: int, max_h: int):
     nw, nh = int(w * scale), int(h * scale)
     return cv2.resize(img, (nw, nh))
 
-def list_images(root: str, recursive: bool) -> List[str]:
-    exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.webp")
-    files = []
-    if os.path.isdir(root):
-        if recursive:
-            for ext in exts:
-                files.extend(glob.glob(os.path.join(root, "**", ext), recursive=True))
-        else:
-            for ext in exts:
-                files.extend(glob.glob(os.path.join(root, ext)))
-    else:
-        files = [root]
-    files = sorted(list(dict.fromkeys(files)))
-    return files
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-# ---------------------------------- 单图处理 ----------------------------------
-def process_image(path: str, outdir: str, face_mesh, args) -> Dict[str, Any]:
-    img = cv2.imread(path)
-    rec = {"input": path}
-    base = os.path.splitext(os.path.basename(path))[0]
-    out_img = os.path.join(outdir, base + "_12palaces_labeled.jpg")
-
+# ----------------------- 对外主函数 -----------------------
+def analyze_image(
+    img_path: os.PathLike | str,
+    out_dir: os.PathLike | str,
+    max_width: int = 1600,
+    max_height: int = 1600,
+    font_path: os.PathLike | None = None,
+) -> Dict[str, Any]:
+    """对单张图片进行分析与渲染并输出到 out_dir。
+    返回 dict: {"output": 输出图片路径, "metrics": {...}}
+    若未检测到人脸，也会输出缩放原图，并在返回中带 error。
+    """
+    img = cv2.imread(str(img_path))
+    rec: Dict[str, Any] = {"input": str(img_path)}
     if img is None:
-        rec["error"]="cannot read image"
-        return rec
+        return {**rec, "error": "cannot read image"}
 
-    h0,w0 = img.shape[:2]
+    h0, w0 = img.shape[:2]
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    result = face_mesh.process(rgb)
+
+    # FaceMesh（静态图）
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as fm:
+        result = fm.process(rgb)
+
+    base = os.path.splitext(os.path.basename(str(img_path)))[0]
+    os.makedirs(out_dir, exist_ok=True)
+    out_img = os.path.join(str(out_dir), base + "_12palaces_labeled.jpg")
 
     if not result.multi_face_landmarks:
-        # 保存原图缩放版
-        img_out = resize_keep_max(img, args.max_width, args.max_height)
+        img_out = resize_keep_max(img, max_width, max_height)
         cv2.imwrite(out_img, img_out)
-        rec.update({"faces":0, "output":out_img, "error":"no face detected"})
-        return rec
+        return {**rec, "faces": 0, "output": out_img, "error": "no face detected"}
 
     fl = result.multi_face_landmarks[0]
     points = [_to_xyzc(lm, w0, h0) for lm in fl.landmark]
 
-    # 计算指标（不在图上写字）
     three = analyze_three_court(points)
     five  = analyze_five_eye(points)
     pal   = analyze_palaces(points, w0, h0)
 
-    # 绘制：网格 + 宫位框 + 标签
     draw = img.copy()
     draw_overlay(draw, fl)
-    draw_palace_boxes_with_labels(draw, pal, font_path=(args.font if args.font else None))
+    draw_palace_boxes_with_labels(draw, pal, font_path=str(font_path) if font_path else None)
 
-    draw = resize_keep_max(draw, args.max_width, args.max_height)
+    draw = resize_keep_max(draw, max_width, max_height)
     cv2.imwrite(out_img, draw)
 
-    rec.update({"faces":1, "output":out_img, "metrics":{"three":three,"five":five,"palaces":pal}})
-    return rec
-
-# ---------------------------------- 主入口 ----------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="输入 图片文件 或 目录")
-    ap.add_argument("--out", required=True, help="输出目录")
-    ap.add_argument("--recursive", action="store_true", help="当 input 为目录时递归处理")
-    ap.add_argument("--save-json", default="", help="保存汇总 JSON 到此路径（可选）")
-    ap.add_argument("--max-width", type=int, default=1600, help="输出图最大宽(仅展示缩放)")
-    ap.add_argument("--max-height", type=int, default=1600, help="输出图最大高(仅展示缩放)")
-    ap.add_argument("--font", default="", help="中文字体路径(.ttf/.otf)。为空则用拼音标签避免乱码")
-    args = ap.parse_args()
-
-    ensure_dir(args.out)
-    files = list_images(args.input, args.recursive)
-    if not files:
-        print("未找到图片。支持: .jpg/.jpeg/.png/.bmp/.webp")
-        return
-
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5
-    )
-
-    results = []
-    for idx, p in enumerate(files, 1):
-        rec = process_image(p, args.out, face_mesh, args)
-        results.append(rec)
-        status = "OK" if "error" not in rec else f"ERR:{rec['error']}"
-        print(f"[{idx}/{len(files)}] {os.path.basename(p)} -> {status} -> {rec.get('output','-')}")
-
-    if args.save_json:
-        with open(args.save_json, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2, default=_json_default)
-        print(f"JSON汇总已保存: {args.save_json}")
-
-if __name__ == "__main__":
-    main()
+    return {
+        **rec,
+        "faces": 1,
+        "output": out_img,
+        "metrics": {"three": three, "five": five, "palaces": pal},
+    }
