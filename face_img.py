@@ -399,3 +399,28 @@ def analyze_image(
         "output": out_img,
         "metrics": {"three": three, "five": five, "palaces": pal},
     }
+
+# 在 face_img.py 末尾附近，加两个辅助函数
+
+def extract_landmarks_xyzc(img_path: str) -> Dict[str, Any]:
+    """仅抽取 468×3 (x,y,z) 关键点（像素坐标），便于入库/检索使用。"""
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return {"input": img_path, "error": "cannot read image"}
+    h0, w0 = img.shape[:2]
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as fm:
+        result = fm.process(rgb)
+    if not result.multi_face_landmarks:
+        return {"input": img_path, "faces": 0, "error": "no face detected"}
+    fl = result.multi_face_landmarks[0]
+    points = [_to_xyzc(lm, w0, h0) for lm in fl.landmark]
+    return {"input": img_path, "faces": 1, "points_xyzc": points}
+
+def save_landmarks_json(img_path: str, json_out: str) -> Dict[str, Any]:
+    rec = extract_landmarks_xyzc(img_path)
+    if "points_xyzc" in rec:
+        with open(json_out, "w", encoding="utf-8") as f:
+            json.dump(rec["points_xyzc"], f, ensure_ascii=False, default=_json_default)
+        rec["json"] = json_out
+    return rec

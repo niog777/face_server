@@ -1,7 +1,4 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# api.py — 只管连通各模块：下载/解码 → 调图像分析 → 静态出图 →（可选）LLM 异步任务
-# ──────────────────────────────────────────────────────────────────────────────
-
+# api.py — 路由与编排（下载/解码 → 调图像分析 或 直接用 metrics → 静态出图 → 可选 LLM 异步任务）
 import os
 import re
 import ipaddress
@@ -17,7 +14,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Any, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -32,12 +29,15 @@ from settings import BASE_DIR, PUBLIC_DIR, ALLOWED_EXT, MAX_DOWNLOAD_BYTES, FONT
 from face_img import analyze_image
 from llm import call_llm_for_face_analysis
 
+# 新增：占位图
+from PIL import Image, ImageDraw, ImageFont
+
 # ---------------- 日志 ----------------
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
 logger = logging.getLogger("facemesh_api")
 
 # ---------------- 应用与静态 ----------------
-app = FastAPI(title="FaceMesh 12 Palaces API", version="3.0.0")
+app = FastAPI(title="FaceMesh 12 Palaces API", version="3.2.0")
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
 
 # ---------------- 任务内存存储 ----------------
@@ -55,7 +55,7 @@ def _new_job(status: str, result_url: str, filename: str, metrics: dict | None) 
         status=status,                 # running/completed/failed
         result_url=result_url,
         filename=filename,
-        metrics=metrics,
+        metrics=metrics,               # 仅服务端保存
         face_analysis=None,
         error=None,
         created_at=_utcnow().isoformat(),
@@ -87,9 +87,12 @@ def _update_job(job_id: str, **fields):
 
 # ---------------- 模型 ----------------
 class AnalyzeReq(BaseModel):
-    image_url: str                # http/https 或 data:image/...;base64,
+    # 改为可选
+    image_url: Optional[str] = None     # http/https 或 data:image/...;base64,
     return_data_url: bool = False
     with_ai: bool = False
+    # 可选：预计算几何指标（传了可跳过人脸检测/绘制）
+    metrics: Optional[Dict[str, Any]] = None
 
 # ---------------- 工具 ----------------
 def decode_base64_forgiving(b64: str) -> bytes:
@@ -113,6 +116,26 @@ def _is_private_host(hostname: str) -> bool:
         return ip.is_private or ip.is_loopback or ip.is_link_local
     except Exception:
         return True
+
+def _make_placeholder(workdir: Path, size: Tuple[int, int]=(1000, 750)) -> Path:
+    """在 metrics-only 模式下生成一张占位图，确保依旧有 result_url / filename。"""
+    w, h = size
+    img = Image.new("RGB", (w, h), color=(245, 245, 245))
+    draw = ImageDraw.Draw(img)
+    title = "No image (metrics-only)"
+    sub = "Face analysis will use provided geometric metrics."
+    try:
+        font_main = ImageFont.truetype(str(FONT_PATH), 36) if FONT_PATH.exists() else None
+        font_sub = ImageFont.truetype(str(FONT_PATH), 24) if FONT_PATH.exists() else None
+    except Exception:
+        font_main = font_sub = None
+    tw, th = draw.textlength(title, font=font_main), 36
+    sw, sh = draw.textlength(sub, font=font_sub), 24
+    draw.text(((w - tw) / 2, h/2 - th - 10), title, fill=(60,60,60), font=font_main, anchor=None)
+    draw.text(((w - sw) / 2, h/2 + 10), sub, fill=(90,90,90), font=font_sub, anchor=None)
+    out = workdir / f"{uuid.uuid4().hex}.jpg"
+    img.save(out, format="JPEG", quality=92)
+    return out
 
 # ---------------- 全局异常 ----------------
 @app.exception_handler(RequestValidationError)
@@ -169,82 +192,109 @@ def _start_llm_background(job_id: str):
     t = threading.Thread(target=_run_llm_job, args=(job_id,), daemon=True)
     t.start()
 
-# ---------------- 主流程：下载 → 分析 → 静态出图 →（可选）LLM ----------------
+# ---------------- 主流程：下载 → （分析 或 直接用 metrics 或 生成占位图） → 静态出图 →（可选）LLM ----------------
 @app.post("/analyze")
 def analyze(req: AnalyzeReq, request: Request):
     client_ip = getattr(request.client, "host", "?")
     ct = request.headers.get("content-type")
     url_in = (req.image_url or "").strip()
     url_preview = (url_in[:80] + "...") if len(url_in) > 80 else url_in
-    logger.info("Incoming /analyze from %s | CT=%s | image_url(len=%d, preview=%r) | return_data_url=%s | with_ai=%s",
-                client_ip, ct, len(url_in), url_preview, req.return_data_url, req.with_ai)
+    logger.info("Incoming /analyze from %s | CT=%s | image_url(%s) | return_data_url=%s | with_ai=%s | metrics=%s",
+                client_ip, ct, ("yes" if url_in else "no"), req.return_data_url, req.with_ai, "yes" if req.metrics else "no")
 
-    if not url_in:
-        raise HTTPException(400, "image_url is required")
+    # 如果既没有 image，也没有 metrics，才报错
+    if not url_in and not req.metrics:
+        raise HTTPException(400, "either image_url or metrics must be provided")
 
     workdir = Path(tempfile.mkdtemp(prefix="facemesh_api_"))
     logger.info("Workdir: %s", workdir)
 
     try:
-        # 解析输入 → 保存图片到临时文件
-        if url_in.startswith("data:"):
-            if "," not in url_in:
-                raise HTTPException(400, "invalid data URL")
-            header, b64 = url_in.split(",", 1)
-            mime = "image/jpeg"
-            if ":" in header:
-                h1 = header.split(":", 1)[1]
-                mime = (h1.split(";")[0] or "image/jpeg").lower()
-            ext_map = {"image/jpeg": ".jpg","image/jpg": ".jpg","image/png": ".png","image/webp": ".webp","image/bmp": ".bmp"}
-            ext = ext_map.get(mime, ".jpg")
-            raw = decode_base64_forgiving(b64)
-            if len(raw) > MAX_DOWNLOAD_BYTES:
-                raise HTTPException(413, "image too large (>20MB)")
-            input_path = workdir / f"{uuid.uuid4().hex}{ext}"
-            input_path.write_bytes(raw)
-            logger.info("Saved decoded data URL to %s (%d bytes)", input_path, len(raw))
+        input_path: Optional[Path] = None
+
+        # 1) 如有 image_url：下载/解码图片；否则 metrics-only：跳过下载
+        if url_in:
+            if url_in.startswith("data:"):
+                if "," not in url_in:
+                    raise HTTPException(400, "invalid data URL")
+                header, b64 = url_in.split(",", 1)
+                mime = "image/jpeg"
+                if ":" in header:
+                    h1 = header.split(":", 1)[1]
+                    mime = (h1.split(";")[0] or "image/jpeg").lower()
+                ext_map = {"image/jpeg": ".jpg","image/jpg": ".jpg","image/png": ".png","image/webp": ".webp","image/bmp": ".bmp"}
+                ext = ext_map.get(mime, ".jpg")
+                raw = decode_base64_forgiving(b64)
+                if len(raw) > MAX_DOWNLOAD_BYTES:
+                    raise HTTPException(413, "image too large (>20MB)")
+                input_path = workdir / f"{uuid.uuid4().hex}{ext}"
+                input_path.write_bytes(raw)
+                logger.info("Saved decoded data URL to %s (%d bytes)", input_path, len(raw))
+            else:
+                parsed = urlparse(url_in)
+                scheme = (parsed.scheme or "").lower()
+                if scheme not in ("http", "https"):
+                    raise HTTPException(400, "image_url must be http(s) or data URL")
+                host = parsed.hostname
+                if not host or _is_private_host(host):
+                    raise HTTPException(400, "refuse to fetch from private/loopback addresses")
+                url_path = parsed.path or ""
+                ext = (os.path.splitext(url_path)[1] or ".jpg").lower()
+                if ext not in ALLOWED_EXT:
+                    ext = ".jpg"
+                input_path = workdir / f"{uuid.uuid4().hex}{ext}"
+                try:
+                    with requests.get(url_in, stream=True, timeout=20) as r:
+                        r.raise_for_status()
+                        ctype = (r.headers.get("content-type", "").split(";")[0] or "").lower()
+                        if ctype not in {"image/jpeg","image/jpg","image/png","image/webp","image/bmp"}:
+                            raise HTTPException(415, f"unsupported content-type: {ctype}")
+                        downloaded = 0
+                        with open(input_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if not chunk:
+                                    continue
+                                downloaded += len(chunk)
+                                if downloaded > MAX_DOWNLOAD_BYTES:
+                                    raise HTTPException(413, "image too large (>20MB)")
+                                f.write(chunk)
+                    logger.info("Downloaded URL to %s (%d bytes)", input_path, input_path.stat().st_size)
+                except Exception as e:
+                    raise HTTPException(502, f"failed to download image: {e}")
+
+        # 2) 走三种路径：
+        #   a) metrics-only（无 image_url）：生成占位图；直接使用 req.metrics
+        #   b) metrics+image：跳过检测，直接使用 req.metrics，出图用原图
+        #   c) 仅 image：做人脸检测并叠加标签
+        rec: Dict[str, Any]
+        if req.metrics and not input_path:
+            # (a) metrics-only
+            placeholder = _make_placeholder(workdir)
+            rec = {
+                "input": None,
+                "faces": 1,
+                "output": str(placeholder),
+                "metrics": req.metrics
+            }
+        elif req.metrics and input_path:
+            # (b) metrics+image：不跑检测，直接把原图作为输出
+            rec = {
+                "input": str(input_path),
+                "faces": 1,
+                "output": str(input_path),
+                "metrics": req.metrics
+            }
         else:
-            parsed = urlparse(url_in)
-            scheme = (parsed.scheme or "").lower()
-            if scheme not in ("http", "https"):
-                raise HTTPException(400, "image_url must be http(s) or data URL")
-            host = parsed.hostname
-            if not host or _is_private_host(host):
-                raise HTTPException(400, "refuse to fetch from private/loopback addresses")
-            url_path = parsed.path or ""
-            ext = (os.path.splitext(url_path)[1] or ".jpg").lower()
-            if ext not in ALLOWED_EXT:
-                ext = ".jpg"
-            input_path = workdir / f"{uuid.uuid4().hex}{ext}"
-            try:
-                with requests.get(url_in, stream=True, timeout=20) as r:
-                    r.raise_for_status()
-                    ctype = (r.headers.get("content-type", "").split(";")[0] or "").lower()
-                    if ctype not in {"image/jpeg","image/jpg","image/png","image/webp","image/bmp"}:
-                        raise HTTPException(415, f"unsupported content-type: {ctype}")
-                    downloaded = 0
-                    with open(input_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if not chunk:
-                                continue
-                            downloaded += len(chunk)
-                            if downloaded > MAX_DOWNLOAD_BYTES:
-                                raise HTTPException(413, "image too large (>20MB)")
-                            f.write(chunk)
-                logger.info("Downloaded URL to %s (%d bytes)", input_path, input_path.stat().st_size)
-            except Exception as e:
-                raise HTTPException(502, f"failed to download image: {e}")
+            # (c) 仅 image：原有流程（检测+绘制）
+            rec = analyze_image(
+                img_path=str(input_path),
+                out_dir=str(workdir),
+                max_width=1600,
+                max_height=1600,
+                font_path=(FONT_PATH if FONT_PATH.exists() else None),
+            )
 
-        # 调 face_img.analyze_image
-        rec = analyze_image(
-            img_path=str(input_path),
-            out_dir=str(workdir),
-            max_width=1600,
-            max_height=1600,
-            font_path=(FONT_PATH if FONT_PATH.exists() else None),
-        )
-
-        # 找输出图
+        # 3) 找输出图
         output_path = Path(rec.get("output") or "")
         if not output_path.exists():
             cands = sorted(workdir.glob("*_12palaces_labeled.jpg"))
@@ -253,21 +303,20 @@ def analyze(req: AnalyzeReq, request: Request):
         if not output_path or not output_path.exists():
             raise HTTPException(500, "output image not found")
 
-        # 移到 public/
+        # 4) 移到 public/
         out_name = f"{uuid.uuid4().hex}.jpg"
         public_path = PUBLIC_DIR / out_name
         shutil.move(str(output_path), str(public_path))
         base = str(request.base_url).rstrip("/")
         result_url = f"{base}/files/{out_name}"
 
-        # 先返回图片
+        # 5) 组织响应
         payload = {"result_url": result_url, "filename": out_name}
-
         if req.return_data_url:
             b64_out = base64.b64encode(public_path.read_bytes()).decode("ascii")
             payload["data_url"] = "data:image/jpeg;base64," + b64_out
 
-        # with_ai=true：无论成功与否，都返回 ai_job（与旧逻辑一致）
+        # 6) with_ai：必返 job_id
         metrics = rec.get("metrics")
         if req.with_ai:
             if not metrics:
@@ -283,7 +332,9 @@ def analyze(req: AnalyzeReq, request: Request):
                 "expires_at": job["expires_at"],
             }
 
-        logger.info("Success -> %s | with_ai=%s", result_url, req.with_ai)
+        logger.info("Success -> %s | with_ai=%s | path=%s",
+                    result_url, req.with_ai,
+                    "metrics-only" if (req.metrics and not url_in) else ("metrics+image" if req.metrics else "image-only"))
         return JSONResponse(payload, background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True))
 
     except HTTPException:
